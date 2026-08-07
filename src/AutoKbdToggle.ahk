@@ -12,6 +12,7 @@ global isBlocked := false
 global ShowNotifications := true
 global HideTrayIconSetting := false
 global RunOnStartup := false
+global KeepInternalKeyboardEnabled := false
 
 ; Auto-elevate to Administrator (Required for Interception kernel driver)
 if not A_IsAdmin {
@@ -29,6 +30,7 @@ if FileExist(ConfigFile) {
     InternalKbdHandle := IniRead(ConfigFile, "Settings", "DeviceHandle", "")
     ShowNotifications := Number(IniRead(ConfigFile, "Settings", "ShowNotifications", "1"))
     HideTrayIconSetting := Number(IniRead(ConfigFile, "Settings", "HideTrayIcon", "0"))
+    KeepInternalKeyboardEnabled := Number(IniRead(ConfigFile, "Settings", "KeepInternalKeyboardEnabled", "0"))
 }
 
 RunOnStartup := IsStartupTaskPresent()
@@ -43,22 +45,30 @@ if (HideTrayIconSetting) {
 ; ==========================================
 TraySetIcon("icon.ico")
 A_TrayMenu.Add()
-A_TrayMenu.Add("Show Popup Notifications", MenuToggleNotifications)
+A_TrayMenu.Add("Keep Internal Keyboard Enabled", MenuToggleKeepKeyboard)
+A_TrayMenu.Add("Recalibrate Internal Keyboard", MenuRecalibrateKeyboard)
+A_TrayMenu.Add()
 A_TrayMenu.Add("Run on Startup", MenuToggleRunOnStartup)
-A_TrayMenu.Add("Recalibrate Internal Keyboard", MenuRecalibrate)
+A_TrayMenu.Add("Show Connection Notifications", MenuToggleNotifications)
 A_TrayMenu.Add("Permanently Hide Tray Icon", MenuHideTrayIcon)
 
-; Set checkmark state for popup notifications
+; Set checkmark state for tray menu items
 if (ShowNotifications) {
-    A_TrayMenu.Check("Show Popup Notifications")
+    A_TrayMenu.Check("Show Connection Notifications")
 } else {
-    A_TrayMenu.Uncheck("Show Popup Notifications")
+    A_TrayMenu.Uncheck("Show Connection Notifications")
 }
 
 if (RunOnStartup) {
     A_TrayMenu.Check("Run on Startup")
 } else {
     A_TrayMenu.Uncheck("Run on Startup")
+}
+
+if (KeepInternalKeyboardEnabled) {
+    A_TrayMenu.Check("Keep Internal Keyboard Enabled")
+} else {
+    A_TrayMenu.Uncheck("Keep Internal Keyboard Enabled")
 }
 
 ; ==========================================
@@ -71,12 +81,21 @@ if (InternalKbdHandle != "") {
     InternalKbdID := FindIDByHandle(InternalKbdHandle)
 }
 
-; If no valid handle/ID found, run the calibration wizard
+keyboardAutoDetected := false
+
 if (InternalKbdID == 0) {
-    CalibrateKeyboard()
-} else {
-    StartAutoToggle()
+    keyboardAutoDetected := TryAutoDetectInternalKeyboard()
+    if (!keyboardAutoDetected) {
+        CalibrateKeyboard()
+    }
 }
+
+if (keyboardAutoDetected) {
+    MsgBox("Automatic detection was attempted for the internal keyboard.`nIf it did not select the intended device, use the system tray menu to recalibrate it.", "Auto-detection", "4096")
+}
+
+; Always start the toggle monitor, regardless of current calibration state
+StartAutoToggle()
 
 ; ==========================================
 ; TRAY MENU ACTIONS
@@ -99,6 +118,14 @@ MenuHideTrayIcon(ItemName, ItemPos, MyMenu) {
     }
 }
 
+MenuToggleKeepKeyboard(ItemName, ItemPos, MyMenu) {
+    global KeepInternalKeyboardEnabled, ConfigFile
+    KeepInternalKeyboardEnabled := !KeepInternalKeyboardEnabled
+    A_TrayMenu.ToggleCheck(ItemName)
+    IniWrite(KeepInternalKeyboardEnabled ? "1" : "0", ConfigFile, "Settings", "KeepInternalKeyboardEnabled")
+    CheckDevices()
+}
+
 MenuToggleRunOnStartup(ItemName, ItemPos, MyMenu) {
     global RunOnStartup, ConfigFile
     RunOnStartup := !RunOnStartup
@@ -117,7 +144,7 @@ MenuToggleRunOnStartup(ItemName, ItemPos, MyMenu) {
     IniWrite(RunOnStartup ? "1" : "0", ConfigFile, "Settings", "RunOnStartup")
 }
 
-MenuRecalibrate(ItemName, ItemPos, MyMenu) {
+MenuRecalibrateKeyboard(ItemName, ItemPos, MyMenu) {
     CalibrateKeyboard()
 }
 
@@ -132,13 +159,14 @@ CalibrateKeyboard() {
         try AHI.UnsubscribeKeyboard(InternalKbdID)
         isBlocked := false
     }
-
-    MsgBox("After pressing OK, Please press ANY KEY on your BUILT-IN LAPTOP KEYBOARD to calibrate (you will only have to do this once).", "Keyboard Calibration", "4096")
     
-    ; Temporarily listen to all keyboard slots (IDs 1 through 10)
-    Loop 10 {
-        try AHI.SubscribeKeyboard(A_Index, false, CalibrationCallback.Bind(A_Index))
+    ; Temporarily listen to every detected keyboard device
+    devList := AHI.GetDeviceList()
+    for id, dev in devList {
+        try AHI.SubscribeKeyboard(id, false, CalibrationCallback.Bind(id))
     }
+
+    MsgBox("Please press ANY KEY on your BUILT-IN LAPTOP KEYBOARD to calibrate (you will only have to do this once).", "Keyboard Calibration", "4096")
 }
 
 CalibrationCallback(id, code, state) {
@@ -150,16 +178,21 @@ CalibrationCallback(id, code, state) {
     }
     
     ; Stop calibration listener
-    Loop 10 {
-        try AHI.UnsubscribeKeyboard(A_Index)
+    devList := AHI.GetDeviceList()
+    for currentId, dev in devList {
+        try AHI.UnsubscribeKeyboard(currentId)
     }
     
-    devList := AHI.GetDeviceList()
-    global InternalKbdID := id
-    global InternalKbdHandle := devList[id].Handle
+    InternalKbdID := id
+    InternalKbdHandle := devList[id].Handle
     
     ; Save hardware handle to config.ini
     IniWrite(InternalKbdHandle, ConfigFile, "Settings", "DeviceHandle")
+    
+    if WinExist("Keyboard Calibration ahk_class #32770") {
+        WinClose("Keyboard Calibration ahk_class #32770")
+        WinWaitClose("Keyboard Calibration ahk_class #32770", , 2)
+    }
     
     MsgBox("Captured Laptop Keyboard Handle:`n" InternalKbdHandle "`n`nRecalibration is available in the system tray.", "Setup Complete", "4096")
     
@@ -169,72 +202,185 @@ CalibrationCallback(id, code, state) {
 FindIDByHandle(targetHandle) {
     devList := AHI.GetDeviceList()
     for id, dev in devList {
-        if (id <= 10 && dev.Handle == targetHandle) {
+        if (dev.Handle == targetHandle) {
             return id
         }
     }
     return 0
 }
 
-IsStartupTaskPresent() {
-    taskName := "AutoToggleInternalKeyboard"
-    exitCode := RunWait('cmd /c schtasks /Query /TN "' taskName '" >nul 2>&1', "", "Hide")
-    if (exitCode != 0) {
+TryAutoDetectInternalKeyboard() {
+    global InternalKbdID, InternalKbdHandle, ConfigFile
+
+    devList := AHI.GetDeviceList()
+    if (!IsObject(devList)) {
         return false
     }
 
-    ; Check if .exe was moved
-    currentPath := A_ScriptFullPath
-    taskPath := GetStartupTaskPath(taskName)
-    if (taskPath != "" && taskPath != currentPath) {
-        UpdateStartupTaskPath(taskName, currentPath)
+    query := "SELECT * FROM Win32_Keyboard"
+    kbdDevices := WMI.ExecQuery(query)
+    for dev in kbdDevices {
+        if (!IsLikelyInternalDevice(dev.PNPDeviceID)) {
+            continue
+        }
+
+        targetHandle := FindHandleForWmiDevice(dev, devList)
+        if (targetHandle != "") {
+            InternalKbdID := FindIDByHandle(targetHandle)
+            InternalKbdHandle := targetHandle
+            IniWrite(InternalKbdHandle, ConfigFile, "Settings", "DeviceHandle")
+            return true
+        }
     }
 
-    return true
+    return false
 }
 
-GetStartupTaskPath(taskName) {
-    output := ""
-    exitCode := RunWait('cmd /c schtasks /Query /V /FO LIST /TN "' taskName '" 2^>nul', output, "Hide")
-    if (exitCode != 0) {
+FindHandleForWmiDevice(wmiDevice, devList) {
+    if (!IsObject(wmiDevice) || !IsObject(devList)) {
         return ""
     }
 
-    for line in StrSplit(output, "`n") {
-        if (SubStr(line, 1, 12) == "Task To Run:") {
-            return Trim(SubStr(line, 13))
+    pnpId := wmiDevice.PNPDeviceID
+    
+    ; 1. MAPPING: Translate squashed WMI formats (MSFT0001) to expanded AHI formats (VEN_MSFT&DEV_0001)
+    if (RegExMatch(pnpId, "(?i)(ACPI|HID)\\([A-Z]{4})([0-9A-Z]{4})", &match)) {
+        targetVendor := match[2]
+        targetDevice := match[3]
+        for id, dev in devList {
+            if InStr(dev.Handle, "VEN_" targetVendor) && InStr(dev.Handle, "DEV_" targetDevice) {
+                return dev.Handle
+            }
+        }
+    }
+
+    ; 2. MAPPING: Standard USB VID/PID matching for external devices
+    targetVid := 0
+    targetPid := 0
+    if (RegExMatch(pnpId, "i)VID_([0-9A-F]{4})", &vidMatch)) {
+        targetVid := Integer("0x" vidMatch[1])
+    }
+    if (RegExMatch(pnpId, "i)PID_([0-9A-F]{4})", &pidMatch)) {
+        targetPid := Integer("0x" pidMatch[1])
+    }
+
+    if (targetVid != 0) {
+        for id, dev in devList {
+            if (targetPid != 0 && dev.VID == targetVid && dev.PID == targetPid) {
+                return dev.Handle
+            }
+            if (targetPid == 0 && dev.VID == targetVid) {
+                return dev.Handle
+            }
+        }
+    }
+
+    ; 3. FALLBACK: Direct substring match
+    for id, dev in devList {
+        if (InStr(dev.Handle, pnpId) || InStr(pnpId, dev.Handle)) {
+            return dev.Handle
         }
     }
 
     return ""
 }
 
-UpdateStartupTaskPath(taskName, newPath) {
-    cmd := 'cmd /c schtasks /Change /TN "' . taskName . '" /TR "' . newPath . '" >nul 2>&1'
-    exitCode := RunWait(cmd, "", "Hide")
-    return exitCode == 0
+IsLikelyInternalDevice(pnpDeviceID) {
+    if (!pnpDeviceID) {
+        return false
+    }
+    return InStr(pnpDeviceID, "ACPI\") || InStr(pnpDeviceID, "PNP") || InStr(pnpDeviceID, "MSFT")
+}
+
+; ==========================================
+; STARTUP TASK LOGIC
+; ==========================================
+RunHidden(cmd) {
+    return RunWait('"' A_ComSpec '" /c ' . cmd, "", "Hide")
+}
+
+IsStartupTaskPresent() {
+    taskName := "\AutoToggleInternalKeyboard"
+    if RunHidden('schtasks /Query /TN "' . taskName . '" >nul 2>&1') != 0 {
+        return false
+    }
+
+    currentPath := NormalizePath(A_ScriptFullPath)
+    taskPath := GetStartupTaskPath(taskName)
+    if (taskPath != "" && taskPath != currentPath) {
+        UpdateStartupTaskPath(currentPath)
+    }
+
+    return true
+}
+
+GetStartupTaskPath(taskName) {
+    DirCreate(A_Temp)
+    taskXmlPath := A_Temp "\AutoToggleTask.xml"
+    if FileExist(taskXmlPath) {
+        FileDelete(taskXmlPath)
+    }
+
+    if RunHidden('schtasks /Query /TN "' . taskName . '" /XML > "' . taskXmlPath . '" 2>nul') != 0 || !FileExist(taskXmlPath) {
+        return ""
+    }
+
+    file := FileOpen(taskXmlPath, "r")
+    if (!file) {
+        return ""
+    }
+
+    xmlText := StrReplace(file.Read(), "`r", "")
+    file.Close()
+    if FileExist(taskXmlPath) {
+        FileDelete(taskXmlPath)
+    }
+    return NormalizePath(ExtractXmlValue(xmlText, "Command"))
+}
+
+ExtractXmlValue(xml, tag) {
+    regex := "s)(?i)<" . tag . ">\s*(.*?)\s*</" . tag . ">"
+    output := ""
+    if RegExMatch(xml, regex, &output) {
+        return Trim(output[1])
+    }
+    return ""
+}
+
+NormalizePath(path) {
+    path := Trim(path)
+    if (SubStr(path, 1, 1) == Chr(34) && SubStr(path, StrLen(path), 1) == Chr(34)) {
+        path := SubStr(path, 2, StrLen(path) - 2)
+    }
+    return StrLower(StrReplace(path, "/", "\\"))
+}
+
+UpdateStartupTaskPath(newPath) {
+    DeleteStartupTask()
+    return RunHidden('schtasks /Create /TN "\AutoToggleInternalKeyboard" /TR "' . NormalizePath(newPath) . '" /SC ONLOGON /RL HIGHEST /F >nul 2>&1') == 0
 }
 
 CreateStartupTask() {
-    taskName := "AutoToggleInternalKeyboard"
-    taskPath := A_ScriptFullPath
-    cmd := 'cmd /c schtasks /Create /TN "' . taskName . '" /TR "' . taskPath . '" /SC ONLOGON /RL HIGHEST /F >nul 2>&1'
-    exitCode := RunWait(cmd, "", "Hide")
-    return exitCode == 0
+    return RunHidden('schtasks /Create /TN "\AutoToggleInternalKeyboard" /TR "' . A_ScriptFullPath . '" /SC ONLOGON /RL HIGHEST /F >nul 2>&1') == 0
 }
 
 DeleteStartupTask() {
-    taskName := "AutoToggleInternalKeyboard"
-    cmd := 'cmd /c schtasks /Delete /TN "' . taskName . '" /F >nul 2>&1'
-    exitCode := RunWait(cmd, "", "Hide")
-    return exitCode == 0
+    return RunHidden('schtasks /Delete /TN "\AutoToggleInternalKeyboard" /F >nul 2>&1') == 0
 }
 
 ; ==========================================
 ; AUTO-TOGGLE MONITORING LOGIC
 ; ==========================================
 StartAutoToggle() {
-    CheckKeyboards()
+    static isStarted := false
+    
+    if (isStarted) {
+        CheckDevices()
+        return
+    }
+    
+    isStarted := true
+    CheckDevices()
 
     static Sink := ComObject("WbemScripting.SWbemSink")
     ComObjConnect(Sink, "WMIEvent_")
@@ -242,38 +388,38 @@ StartAutoToggle() {
 }
 
 WMIEvent_OnObjectReady(params*) {
-    CheckKeyboards()
+    CheckDevices()
 }
 
-CheckKeyboards() {
-    global isBlocked, InternalKbdID, InternalKbdHandle
+CheckDevices() {
+    global isBlocked, InternalKbdID, InternalKbdHandle, KeepInternalKeyboardEnabled
     
     if (InternalKbdID == 0 || AHI.GetDeviceList()[InternalKbdID].Handle != InternalKbdHandle) {
         InternalKbdID := FindIDByHandle(InternalKbdHandle)
     }
 
-    if (InternalKbdID == 0) {
-        return
+    externalKeyboardConnected := false
+    devList := AHI.GetDeviceList()
+
+    if (InternalKbdID != 0) {
+        query := "SELECT * FROM Win32_Keyboard"
+        kbdDevices := WMI.ExecQuery(query)
+        for dev in kbdDevices {
+            mappedHandle := FindHandleForWmiDevice(dev, devList)
+            
+            if (mappedHandle == InternalKbdHandle) {
+                continue
+            }
+            if (InStr(dev.PNPDeviceID, "ACPI\") && mappedHandle == "") {
+                continue
+            }
+            
+            externalKeyboardConnected := true
+            break
+        }
     }
 
-    query := "SELECT * FROM Win32_Keyboard"
-    kbdDevices := WMI.ExecQuery(query)
-    
-    externalConnected := false
-    for dev in kbdDevices {
-        if InStr(dev.PNPDeviceID, "ACPI\") {
-            continue
-        }
-            
-        if InStr(InternalKbdHandle, dev.PNPDeviceID) {
-            continue
-        }
-            
-        externalConnected := true
-        break
-    }
-    
-    if (externalConnected) {
+    if (externalKeyboardConnected && !KeepInternalKeyboardEnabled) {
         if (!isBlocked) {
             AHI.SubscribeKeyboard(InternalKbdID, true, (*)=>0)
             isBlocked := true
