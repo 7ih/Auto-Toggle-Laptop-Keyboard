@@ -1,9 +1,8 @@
 ﻿#Requires AutoHotkey v2.0
 #SingleInstance Force
-#include Lib\AutoHotInterception.ahk
 
-; Wait for Windows desktop/system tray to load before creating the icon
-ProcessWait("explorer.exe")
+SetWorkingDir(A_ScriptDir)
+#include Lib\AutoHotInterception.ahk
 
 ; ==========================================
 ; GLOBALS & ELEVATION
@@ -14,45 +13,53 @@ if !A_IsAdmin {
 }
 
 global ConfigFile := A_ScriptDir "\config.ini"
-global InternalKbdID := 0, InternalKbdHandle := "", isBlocked := false
-global AHI := AutoHotInterception()
-global WMI := ComObjGet("winmgmts:{impersonationLevel=impersonate}!\\.\root\cimv2")
+global InternalHandles := IniRead(ConfigFile, "Settings", "InternalHandles", "")
+global isBlocked := false
 
-; Keep script running persistently in the background
+global AHI := ""
+try {
+    AHI := AutoHotInterception()
+} catch as err {
+    MsgBox("Failed to initialize AutoHotInterception driver!`n`nError: " err.Message, "AHI Error", "16")
+    ExitApp()
+}
+
 Persistent()
 
 ; ==========================================
 ; LOAD CONFIG & INITIALIZE
 ; ==========================================
-InternalKbdHandle := IniRead(ConfigFile, "Settings", "DeviceHandle", "")
 global ShowNotifications := Number(IniRead(ConfigFile, "Settings", "ShowNotifications", 1))
 global HideTrayIconSetting := Number(IniRead(ConfigFile, "Settings", "HideTrayIcon", 0))
 global RunOnStartup := Number(IniRead(ConfigFile, "Settings", "RunOnStartup", 0))
 global KeepInternalKeyboardEnabled := Number(IniRead(ConfigFile, "Settings", "KeepInternalKeyboardEnabled", 0))
 
-if (HideTrayIconSetting)
-    A_IconHidden := true
 if (RunOnStartup)
     SetStartupTask(true)
+
+; Global array of internal device IDs captured ONCE at startup
+global InternalIDs := []
+
+if (InternalHandles == "") {
+    CalibrateKeyboard()
+} else {
+    MapInternalIDs()
+    StartAutoToggle()
+}
+
+if (RunOnStartup)
+    SetStartupTask(true)    ; Makes sure task exists, and at correct location
+
+; Launch the tray menu builder asynchronously in the background
+SetTimer(InitTrayMenu, -1)
 
 ; ==========================================
 ; SYSTEM TRAY MENU
 ; ==========================================
 global IconFile := A_ScriptDir "\icon.ico"
-A_IconHidden := HideTrayIconSetting
-SetTimer(InitTrayMenu, -1000)
-
+A_IconHidden := HideTrayIconSetting ? true : false
 InitTrayMenu(*) {
-    static initialized := false
-    if (initialized)
-        return
-
-    if !WinExist("ahk_class Shell_TrayWnd") {
-        SetTimer(InitTrayMenu, -1000)
-        return
-    }
-
-    initialized := true
+    WinWait("ahk_class Shell_TrayWnd", "", 10)
 
     if FileExist(IconFile)
         TraySetIcon(IconFile)
@@ -76,22 +83,6 @@ InitTrayMenu(*) {
     (ShowNotifications) && A_TrayMenu.Check("Show Connection Notifications")
 }
 
-; ==========================================
-; MAIN INIT LOGIC
-; ==========================================
-if (InternalKbdHandle != "")
-    InternalKbdID := FindIDByHandle(InternalKbdHandle)
-
-if (!InternalKbdID && TryAutoDetectInternalKeyboard())
-    MsgBox("Automatic detection was attempted for the internal keyboard.`nIf it did not select the intended device, use the tray menu to recalibrate.", "Auto-detection", "4096")
-else if (!InternalKbdID)
-    CalibrateKeyboard()
-
-StartAutoToggle()
-
-; ==========================================
-; TRAY MENU ACTIONS
-; ==========================================
 ToggleNotify(*) {
     global ShowNotifications := !ShowNotifications
     A_TrayMenu.ToggleCheck("Show Connection Notifications")
@@ -120,91 +111,106 @@ HideTray(*) {
 }
 
 SetStartupTask(enable) {
-    cmd := enable ? 'schtasks /Create /TN "\AutoToggleInternalKeyboard" /TR "\"' A_ScriptFullPath '\"" /SC ONLOGON /RL HIGHEST /F' 
+    cmd := enable ? 'schtasks /Create /TN "\AutoToggleInternalKeyboard" /TR "\"' A_ScriptFullPath '\"" /WorkingDirectory "' A_ScriptDir '" /SC ONLOGON /RL HIGHEST /F' 
                   : 'schtasks /Delete /TN "\AutoToggleInternalKeyboard" /F'
     RunWait(A_ComSpec " /c " cmd, "", "Hide")
 }
 
 ; ==========================================
-; CALIBRATION & AUTO-DETECT
+; MAP INTERNAL IDs (Called ONCE at Startup)
 ; ==========================================
-CalibrateKeyboard() {
-    global isBlocked
-    if (isBlocked && InternalKbdID)
-        try AHI.UnsubscribeKeyboard(InternalKbdID), isBlocked := false
+MapInternalIDs() {
+    global InternalIDs, InternalHandles
+    InternalIDs := []
     
-    for id, dev in AHI.GetDeviceList()
-        try AHI.SubscribeKeyboard(id, false, CalibrationCallback.Bind(id))
+    if (InternalHandles == "")
+        return
 
-    MsgBox("Please press ANY KEY on your BUILT-IN LAPTOP KEYBOARD to calibrate.", "Calibration", "4096")
+    ; Safe call to GetDeviceList ONCE during initialization
+    devList := AHI.GetDeviceList()
+    for id, dev in devList {
+        if (dev.IsMouse || dev.Handle == "")
+            continue
+        if InStr(InternalHandles, dev.Handle) {
+            InternalIDs.Push(id)
+        }
+    }
 }
 
-CalibrationCallback(id, code, state) {
-    global InternalKbdID, InternalKbdHandle
-    if (!state)
-        return ; Ignore key releases
-    
-    for currentId, dev in AHI.GetDeviceList()
-        try AHI.UnsubscribeKeyboard(currentId)
-    
-    InternalKbdID := id, InternalKbdHandle := AHI.GetDeviceList()[id].Handle
-    IniWrite(InternalKbdHandle, ConfigFile, "Settings", "DeviceHandle")
-    
-    if WinExist("Calibration ahk_class #32770") {
-        WinClose("Calibration ahk_class #32770")
-        WinWaitClose("Calibration ahk_class #32770", , 2)
+; ==========================================
+; CALIBRATION (Captures Baseline Raw Count)
+; ==========================================
+CalibrateKeyboard() {
+    global InternalHandles, isBlocked
+
+    if (isBlocked) {
+        for index, kbdID in InternalIDs
+            try AHI.UnsubscribeKeyboard(kbdID)
+        isBlocked := false
     }
+
+    MsgBox("1. UNPLUG all external USB/Bluetooth keyboards.`n2. Click OK.", "Auto Toggle Laptop Keyboard - Calibration", "4096")
+
+    ; 1. Map Interception Internal Handles
+    InternalHandles := ""
+    devList := AHI.GetDeviceList()
+    for id, dev in devList {
+        if (dev.IsMouse || dev.Handle == "")
+            continue
+        InternalHandles .= dev.Handle "|"
+    }
+    IniWrite(InternalHandles, ConfigFile, "Settings", "InternalHandles")
+
+    ; 2. Capture Baseline Raw Input Keyboard Count (while external is unplugged)
+    baselineCount := GetCurrentRawKeyboardCount()
+    IniWrite(baselineCount, ConfigFile, "Settings", "BaselineRawCount")
+
+    MsgBox("Calibration Successful!`n`nYou may now plug your external keyboard back in.", "Setup Complete", "4096")
     
-    MsgBox("Captured Handle:`n" InternalKbdHandle, "Setup Complete", "4096")
+    MapInternalIDs()
     StartAutoToggle()
 }
 
-TryAutoDetectInternalKeyboard() {
-    global InternalKbdID, InternalKbdHandle
-    devList := AHI.GetDeviceList()
+; ==========================================
+; CRASH-PROOF HOTPLUG DETECTION
+; ==========================================
+IsExternalKeyboardPresentWindowsAPI() {
+    baselineCount := Number(IniRead(ConfigFile, "Settings", "BaselineRawCount", 0))
+    if (baselineCount == 0)
+        return false
+
+    currentCount := GetCurrentRawKeyboardCount()
     
-    for dev in WMI.ExecQuery("SELECT * FROM Win32_Keyboard") {
-        if InStr(dev.PNPDeviceID, "ACPI\") || InStr(dev.PNPDeviceID, "PNP") || InStr(dev.PNPDeviceID, "MSFT") {
-            if (handle := FindHandleForWmiDevice(dev.PNPDeviceID, devList)) {
-                InternalKbdHandle := handle, InternalKbdID := FindIDByHandle(handle)
-                IniWrite(InternalKbdHandle, ConfigFile, "Settings", "DeviceHandle")
-                return true
-            }
-        }
-    }
-    return false
+    ; If Windows currently sees more raw keyboards than our baseline, an external device is attached
+    return (currentCount > baselineCount)
 }
 
-FindHandleForWmiDevice(pnpId, devList) {
-    ; 1. Translate squashed WMI formats (e.g. MSFT0001 -> VEN_MSFT&DEV_0001)
-    if RegExMatch(pnpId, "(?i)(ACPI|HID)\\([A-Z]{4})([0-9A-Z]{4})", &m) {
-        for id, dev in devList
-            if InStr(dev.Handle, "VEN_" m[2]) && InStr(dev.Handle, "DEV_" m[3])
-                return dev.Handle
-    }
-    ; 2. Standard USB VID/PID matching
-    if RegExMatch(pnpId, "i)VID_([0-9A-F]{4})(?:.*PID_([0-9A-F]{4}))?", &m) {
-        vid := Integer("0x" m[1]), pid := m[2] != "" ? Integer("0x" m[2]) : 0
-        for id, dev in devList
-            if dev.VID == vid && (!pid || dev.PID == pid)
-                return dev.Handle
-    }
-    ; 3. Direct substring fallback
-    for id, dev in devList
-        if InStr(dev.Handle, pnpId) || InStr(pnpId, dev.Handle)
-            return dev.Handle
-    return ""
-}
+GetCurrentRawKeyboardCount() {
+    static RIM_TYPEKEYBOARD := 1
+    
+    count := 0
+    if DllCall("User32\GetRawInputDeviceList", "Ptr", 0, "UInt*", &count, "UInt", 8) != 0
+        return 0
+        
+    if (count == 0)
+        return 0
 
-FindIDByHandle(targetHandle) {
-    for id, dev in AHI.GetDeviceList()
-        if (dev.Handle == targetHandle)
-            return id
-    return 0
+    RAWINPUTDEVICELIST := Buffer(count * 8, 0)
+    if DllCall("User32\GetRawInputDeviceList", "Ptr", RAWINPUTDEVICELIST, "UInt*", &count, "UInt", 8) == -1
+        return 0
+
+    keyboardCount := 0
+    Loop count {
+        type := NumGet(RAWINPUTDEVICELIST, (A_Index - 1) * 8 + 4, "UInt")
+        if (type == RIM_TYPEKEYBOARD)
+            keyboardCount++
+    }
+
+    return keyboardCount
 }
 
 ; ==========================================
-; MONITORING & TOGGLING
+; SAFE MONITORING (No Interception Polling)
 ; ==========================================
 StartAutoToggle() {
     static isStarted := false
@@ -215,50 +221,37 @@ StartAutoToggle() {
     isStarted := true
     CheckDevices()
 
-    static Sink := ComObject("WbemScripting.SWbemSink")
-    ComObjConnect(Sink, "WMIEvent_")
-    WMI.ExecNotificationQueryAsync(Sink, "SELECT * FROM Win32_DeviceChangeEvent")
+    OnMessage(0x0219, OnDeviceChange)
 }
 
-WMIEvent_OnObjectReady(params*) => CheckDevices()
-
-CheckDevices() {
-    global isBlocked, InternalKbdID
-    devList := AHI.GetDeviceList()
-
-    if (!InternalKbdID || !devList.Has(InternalKbdID) || devList[InternalKbdID].Handle != InternalKbdHandle)
-        InternalKbdID := FindIDByHandle(InternalKbdHandle)
-
-    extConnected := false
-
-    if (InternalKbdID) {
-        ; Check Interception's actual hardware list for any external keyboards
-        for id, dev in devList {
-            if (dev.IsMouse)
-                continue
-            if (id == InternalKbdID)
-                continue
-
-            ; If another physical keyboard ID exists, it's real
-            extConnected := true
-            break
-        }
+OnDeviceChange(wParam, lParam, msg, hwnd) {
+    if (wParam == 0x8000 || wParam == 0x8004) {
+        ; Wait 1.5 seconds for Windows PnP to fully settle
+        SetTimer(CheckDevices, -1500)
     }
+}
 
-    ; If the internal keyboard cannot be identified, do not assume an external keyboard is present.
+; Check for external keyboards using Windows Native Raw Input API (100% safe for Interception)
+CheckDevices() {
+    global isBlocked, InternalIDs, KeepInternalKeyboardEnabled
 
+    if (InternalIDs.Length == 0)
+        return
+
+    extConnected := IsExternalKeyboardPresentWindowsAPI()
     shouldBlock := extConnected && !KeepInternalKeyboardEnabled
 
     if (shouldBlock && !isBlocked) {
-        AHI.SubscribeKeyboard(InternalKbdID, true, (*)=>0)
+        for index, kbdID in InternalIDs
+            try AHI.SubscribeKeyboard(kbdID, true, (*)=>0)
         isBlocked := true
-        ShowOSD("External Keyboard Detected`nInternal Keyboard BLOCKED")
+        ShowOSD("External Keyboard Detected`nInternal Keyboards BLOCKED")
+        
     } else if (!shouldBlock && isBlocked) {
-        if (InternalKbdID)
-            AHI.UnsubscribeKeyboard(InternalKbdID)
+        for index, kbdID in InternalIDs
+            try AHI.UnsubscribeKeyboard(kbdID)
         isBlocked := false
-        if (!extConnected) 
-            ShowOSD("External Keyboard Disconnected`nInternal Keyboard ACTIVE")
+        ShowOSD("External Keyboard Disconnected`nInternal Keyboards ACTIVE")
     }
 }
 
