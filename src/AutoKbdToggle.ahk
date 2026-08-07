@@ -8,15 +8,10 @@
 global ConfigFile := A_ScriptDir "\config.ini"
 global InternalKbdID := 0
 global InternalKbdHandle := ""
-global InternalMouseID := 0
-global InternalMouseHandle := ""
 global isBlocked := false
-global isMouseBlocked := false
 global ShowNotifications := true
 global HideTrayIconSetting := false
 global RunOnStartup := false
-global KeepInternalKeyboardEnabled := false
-global KeepInternalMouseEnabled := false
 
 ; Auto-elevate to Administrator (Required for Interception kernel driver)
 if not A_IsAdmin {
@@ -32,11 +27,8 @@ global WMI := ComObjGet("winmgmts:{impersonationLevel=impersonate}!\\.\root\cimv
 ; ==========================================
 if FileExist(ConfigFile) {
     InternalKbdHandle := IniRead(ConfigFile, "Settings", "DeviceHandle", "")
-    InternalMouseHandle := IniRead(ConfigFile, "Settings", "InternalMouseHandle", "")
     ShowNotifications := Number(IniRead(ConfigFile, "Settings", "ShowNotifications", "1"))
     HideTrayIconSetting := Number(IniRead(ConfigFile, "Settings", "HideTrayIcon", "0"))
-    KeepInternalKeyboardEnabled := Number(IniRead(ConfigFile, "Settings", "KeepInternalKeyboardEnabled", "0"))
-    KeepInternalMouseEnabled := Number(IniRead(ConfigFile, "Settings", "KeepInternalMouseEnabled", "0"))
 }
 
 RunOnStartup := IsStartupTaskPresent()
@@ -53,10 +45,7 @@ TraySetIcon("icon.ico")
 A_TrayMenu.Add()
 A_TrayMenu.Add("Show Popup Notifications", MenuToggleNotifications)
 A_TrayMenu.Add("Run on Startup", MenuToggleRunOnStartup)
-A_TrayMenu.Add("Keep Internal Keyboard Enabled", MenuToggleKeepKeyboard)
-A_TrayMenu.Add("Keep Internal Mouse Enabled", MenuToggleKeepMouse)
-A_TrayMenu.Add("Recalibrate Internal Keyboard", MenuRecalibrateKeyboard)
-A_TrayMenu.Add("Recalibrate Internal Mouse", MenuRecalibrateMouse)
+A_TrayMenu.Add("Recalibrate Internal Keyboard", MenuRecalibrate)
 A_TrayMenu.Add("Permanently Hide Tray Icon", MenuHideTrayIcon)
 
 ; Set checkmark state for popup notifications
@@ -72,18 +61,6 @@ if (RunOnStartup) {
     A_TrayMenu.Uncheck("Run on Startup")
 }
 
-if (KeepInternalKeyboardEnabled) {
-    A_TrayMenu.Check("Keep Internal Keyboard Enabled")
-} else {
-    A_TrayMenu.Uncheck("Keep Internal Keyboard Enabled")
-}
-
-if (KeepInternalMouseEnabled) {
-    A_TrayMenu.Check("Keep Internal Mouse Enabled")
-} else {
-    A_TrayMenu.Uncheck("Keep Internal Mouse Enabled")
-}
-
 ; ==========================================
 ; MAIN INIT LOGIC
 ; ==========================================
@@ -93,11 +70,8 @@ Persistent()
 if (InternalKbdHandle != "") {
     InternalKbdID := FindIDByHandle(InternalKbdHandle)
 }
-if (InternalMouseHandle != "") {
-    InternalMouseID := FindIDByHandle(InternalMouseHandle)
-}
 
-; If no keyboard handle found, run keyboard calibration; mouse can be calibrated later
+; If no valid handle/ID found, run the calibration wizard
 if (InternalKbdID == 0) {
     CalibrateKeyboard()
 } else {
@@ -125,22 +99,6 @@ MenuHideTrayIcon(ItemName, ItemPos, MyMenu) {
     }
 }
 
-MenuToggleKeepKeyboard(ItemName, ItemPos, MyMenu) {
-    global KeepInternalKeyboardEnabled, ConfigFile
-    KeepInternalKeyboardEnabled := !KeepInternalKeyboardEnabled
-    A_TrayMenu.ToggleCheck(ItemName)
-    IniWrite(KeepInternalKeyboardEnabled ? "1" : "0", ConfigFile, "Settings", "KeepInternalKeyboardEnabled")
-    CheckDevices()
-}
-
-MenuToggleKeepMouse(ItemName, ItemPos, MyMenu) {
-    global KeepInternalMouseEnabled, ConfigFile
-    KeepInternalMouseEnabled := !KeepInternalMouseEnabled
-    A_TrayMenu.ToggleCheck(ItemName)
-    IniWrite(KeepInternalMouseEnabled ? "1" : "0", ConfigFile, "Settings", "KeepInternalMouseEnabled")
-    CheckDevices()
-}
-
 MenuToggleRunOnStartup(ItemName, ItemPos, MyMenu) {
     global RunOnStartup, ConfigFile
     RunOnStartup := !RunOnStartup
@@ -159,12 +117,8 @@ MenuToggleRunOnStartup(ItemName, ItemPos, MyMenu) {
     IniWrite(RunOnStartup ? "1" : "0", ConfigFile, "Settings", "RunOnStartup")
 }
 
-MenuRecalibrateKeyboard(ItemName, ItemPos, MyMenu) {
+MenuRecalibrate(ItemName, ItemPos, MyMenu) {
     CalibrateKeyboard()
-}
-
-MenuRecalibrateMouse(ItemName, ItemPos, MyMenu) {
-    CalibrateMouse()
 }
 
 ; ==========================================
@@ -201,49 +155,14 @@ CalibrationCallback(id, code, state) {
     }
     
     devList := AHI.GetDeviceList()
-    InternalKbdID := id
-    InternalKbdHandle := devList[id].Handle
+    global InternalKbdID := id
+    global InternalKbdHandle := devList[id].Handle
     
     ; Save hardware handle to config.ini
     IniWrite(InternalKbdHandle, ConfigFile, "Settings", "DeviceHandle")
     
     MsgBox("Captured Laptop Keyboard Handle:`n" InternalKbdHandle "`n`nRecalibration is available in the system tray.", "Setup Complete", "4096")
     
-    StartAutoToggle()
-}
-
-CalibrateMouse() {
-    global isMouseBlocked, InternalMouseID
-
-    if (isMouseBlocked && InternalMouseID != 0) {
-        try AHI.UnsubscribeMouseButtons(InternalMouseID)
-        try AHI.UnsubscribeMouseMoveRelative(InternalMouseID)
-        try AHI.UnsubscribeMouseMoveAbsolute(InternalMouseID)
-        isMouseBlocked := false
-    }
-
-    MsgBox("After pressing OK, please press ANY BUTTON on your BUILT-IN TRACKPAD or internal pointing device to calibrate.", "Mouse Calibration", "4096")
-    Loop 10 {
-        try AHI.SubscribeMouseButtons(A_Index, false, MouseCalibrationCallback.Bind(A_Index))
-    }
-}
-
-MouseCalibrationCallback(id, code, state) {
-    global InternalMouseID, InternalMouseHandle, ConfigFile
-
-    if (!state) {
-        return
-    }
-
-    Loop 10 {
-        try AHI.UnsubscribeMouseButtons(A_Index)
-    }
-
-    devList := AHI.GetDeviceList()
-    InternalMouseID := id
-    InternalMouseHandle := devList[id].Handle
-    IniWrite(InternalMouseHandle, ConfigFile, "Settings", "InternalMouseHandle")
-    MsgBox("Captured Internal Mouse Handle:`n" InternalMouseHandle "`n`nRecalibration is available in the system tray.", "Setup Complete", "4096")
     StartAutoToggle()
 }
 
@@ -326,50 +245,35 @@ WMIEvent_OnObjectReady(params*) {
     CheckKeyboards()
 }
 
-CheckDevices() {
-    global isBlocked, isMouseBlocked, InternalKbdID, InternalKbdHandle, InternalMouseID, InternalMouseHandle, KeepInternalKeyboardEnabled, KeepInternalMouseEnabled
+CheckKeyboards() {
+    global isBlocked, InternalKbdID, InternalKbdHandle
     
     if (InternalKbdID == 0 || AHI.GetDeviceList()[InternalKbdID].Handle != InternalKbdHandle) {
         InternalKbdID := FindIDByHandle(InternalKbdHandle)
     }
-    if (InternalMouseID == 0 || AHI.GetDeviceList()[InternalMouseID].Handle != InternalMouseHandle) {
-        InternalMouseID := FindIDByHandle(InternalMouseHandle)
+
+    if (InternalKbdID == 0) {
+        return
     }
 
-    externalKeyboardConnected := false
-    externalMouseConnected := false
-
-    if (InternalKbdID != 0) {
-        query := "SELECT * FROM Win32_Keyboard"
-        kbdDevices := WMI.ExecQuery(query)
-        for dev in kbdDevices {
-            if InStr(dev.PNPDeviceID, "ACPI\\") {
-                continue
-            }
-            if InStr(InternalKbdHandle, dev.PNPDeviceID) {
-                continue
-            }
-            externalKeyboardConnected := true
-            break
+    query := "SELECT * FROM Win32_Keyboard"
+    kbdDevices := WMI.ExecQuery(query)
+    
+    externalConnected := false
+    for dev in kbdDevices {
+        if InStr(dev.PNPDeviceID, "ACPI\") {
+            continue
         }
-    }
-
-    if (InternalMouseID != 0) {
-        query := "SELECT * FROM Win32_PointingDevice"
-        mouseDevices := WMI.ExecQuery(query)
-        for dev in mouseDevices {
-            if InStr(dev.PNPDeviceID, "ACPI\\") {
-                continue
-            }
-            if InStr(InternalMouseHandle, dev.PNPDeviceID) {
-                continue
-            }
-            externalMouseConnected := true
-            break
+            
+        if InStr(InternalKbdHandle, dev.PNPDeviceID) {
+            continue
         }
+            
+        externalConnected := true
+        break
     }
-
-    if (externalKeyboardConnected && !KeepInternalKeyboardEnabled) {
+    
+    if (externalConnected) {
         if (!isBlocked) {
             AHI.SubscribeKeyboard(InternalKbdID, true, (*)=>0)
             isBlocked := true
@@ -382,40 +286,6 @@ CheckDevices() {
             ShowOSD("External Keyboard Disconnected`nInternal Keyboard ACTIVE")
         }
     }
-
-    if (externalMouseConnected && !KeepInternalMouseEnabled) {
-        if (!isMouseBlocked) {
-            BlockInternalMouse()
-            ShowOSD("External Mouse Detected`nInternal Trackpad BLOCKED")
-        }
-    } else {
-        if (isMouseBlocked) {
-            UnblockInternalMouse()
-            ShowOSD("External Mouse Disconnected`nInternal Trackpad ACTIVE")
-        }
-    }
-}
-
-BlockInternalMouse() {
-    global isMouseBlocked, InternalMouseID
-    if (InternalMouseID == 0) {
-        return
-    }
-    try AHI.SubscribeMouseButtons(InternalMouseID, true, (*)=>0)
-    try AHI.SubscribeMouseMoveRelative(InternalMouseID, true, (*)=>0)
-    try AHI.SubscribeMouseMoveAbsolute(InternalMouseID, true, (*)=>0)
-    isMouseBlocked := true
-}
-
-UnblockInternalMouse() {
-    global isMouseBlocked, InternalMouseID
-    if (InternalMouseID == 0) {
-        return
-    }
-    try AHI.UnsubscribeMouseButtons(InternalMouseID)
-    try AHI.UnsubscribeMouseMoveRelative(InternalMouseID)
-    try AHI.UnsubscribeMouseMoveAbsolute(InternalMouseID)
-    isMouseBlocked := false
 }
 
 ShowOSD(Message) {
