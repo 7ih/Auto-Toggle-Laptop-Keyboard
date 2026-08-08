@@ -114,7 +114,7 @@ HideTray(*) {
 }
 
 SetStartupTask(enable) {
-    cmd := enable ? 'schtasks /Create /TN "\AutoToggleInternalKeyboard" /TR "\"' A_ScriptFullPath '\"" /WorkingDirectory "' A_ScriptDir '" /SC ONLOGON /RL HIGHEST /F' 
+    cmd := enable ? 'schtasks /Create /TN "\AutoToggleInternalKeyboard" /TR "' . A_ScriptFullPath . '" /SC ONLOGON /RL HIGHEST /F' 
                   : 'schtasks /Delete /TN "\AutoToggleInternalKeyboard" /F'
     RunWait(A_ComSpec " /c " cmd, "", "Hide")
 }
