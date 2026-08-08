@@ -5,7 +5,7 @@ IMPORTANT: This program installs a third party driver for the keyboard, which ma
 
 ## Installation
 note: this setup is for 64 bit
-1. [Download the repository](https://github.com/7ih/Auto-Toggle-Laptop-Keyboard/archive/refs/heads/main.zip) (feel free to delete the "src" folder if you're not a developer)
+1. [Download the repository](https://github.com/7ih/Auto-Toggle-Laptop-Keyboard/archive/refs/heads/main.zip) and unzip (feel free to delete the "src" folder if you're not a developer)
 2. Run install.bat
 
 When installing interception-driver-fix, enabling "lockdown driver permissions" is recommended.
