@@ -34,11 +34,17 @@ global HideTrayIconSetting := Number(IniRead(ConfigFile, "Settings", "HideTrayIc
 global RunOnStartup := Number(IniRead(ConfigFile, "Settings", "RunOnStartup", 0))
 global KeepInternalKeyboardEnabled := Number(IniRead(ConfigFile, "Settings", "KeepInternalKeyboardEnabled", 0))
 
+global InternalIDs := []
+
+; IF config has startup unchecked, query Task Scheduler to verify
+if (!RunOnStartup && CheckTaskExists()) {
+    global RunOnStartup := 1
+    IniWrite(1, ConfigFile, "Settings", "RunOnStartup")
+}
+
+; Ensure task remains configured with correct script location and working directory
 if (RunOnStartup)
     SetStartupTask(true)
-
-; Global array of internal device IDs captured ONCE at startup
-global InternalIDs := []
 
 if (InternalHandles == "") {
     CalibrateKeyboard()
@@ -47,19 +53,16 @@ if (InternalHandles == "") {
     StartAutoToggle()
 }
 
-if (RunOnStartup)
-    SetStartupTask(true)    ; Makes sure task exists, and at correct location
-
-; Launch the tray menu builder asynchronously in the background
-SetTimer(InitTrayMenu, -1)
-
 ; ==========================================
 ; SYSTEM TRAY MENU
 ; ==========================================
 global IconFile := A_ScriptDir "\icon.ico"
 A_IconHidden := HideTrayIconSetting ? true : false
+
+SetTimer(InitTrayMenu, -1)
+
 InitTrayMenu(*) {
-    WinWait("ahk_class Shell_TrayWnd", "", 10)
+    WinWait("ahk_class Shell_TrayWnd")
 
     if FileExist(IconFile)
         TraySetIcon(IconFile)
@@ -116,6 +119,11 @@ SetStartupTask(enable) {
     RunWait(A_ComSpec " /c " cmd, "", "Hide")
 }
 
+CheckTaskExists() {
+    ; Runs schtasks query silently; returns true (1) if task exists, false (0) if not
+    return (RunWait(A_ComSpec ' /c schtasks /Query /TN "\AutoToggleInternalKeyboard"', "", "Hide") == 0)
+}
+
 ; ==========================================
 ; MAP INTERNAL IDs (Called ONCE at Startup)
 ; ==========================================
@@ -126,7 +134,6 @@ MapInternalIDs() {
     if (InternalHandles == "")
         return
 
-    ; Safe call to GetDeviceList ONCE during initialization
     devList := AHI.GetDeviceList()
     for id, dev in devList {
         if (dev.IsMouse || dev.Handle == "")
@@ -138,7 +145,7 @@ MapInternalIDs() {
 }
 
 ; ==========================================
-; CALIBRATION (Captures Baseline Raw Count)
+; CALIBRATION (Captures Baseline)
 ; ==========================================
 CalibrateKeyboard() {
     global InternalHandles, isBlocked
@@ -149,7 +156,7 @@ CalibrateKeyboard() {
         isBlocked := false
     }
 
-    MsgBox("1. UNPLUG all external USB/Bluetooth keyboards.`n2. Click OK.", "Auto Toggle Laptop Keyboard - Calibration", "4096")
+    MsgBox("1. UNPLUG all external USB/Bluetooth keyboards.`n2. Click OK.", "Auto Toggle Laptop Keyboard", "4096")
 
     ; 1. Map Interception Internal Handles
     InternalHandles := ""
@@ -159,49 +166,58 @@ CalibrateKeyboard() {
             continue
         InternalHandles .= dev.Handle "|"
     }
+    InternalHandles := Trim(InternalHandles, "|")
     IniWrite(InternalHandles, ConfigFile, "Settings", "InternalHandles")
 
-    ; 2. Capture Baseline Raw Input Keyboard Count (while external is unplugged)
+    ; 2. Capture Baseline Raw Input Keyboard Count
     baselineCount := GetCurrentRawKeyboardCount()
     IniWrite(baselineCount, ConfigFile, "Settings", "BaselineRawCount")
 
-    MsgBox("Calibration Successful!`n`nYou may now plug your external keyboard back in.", "Setup Complete", "4096")
+    MsgBox("You may now plug your external keyboard back in.`nRecalibration is available in system tray options.", "Setup Complete", "4096")
     
     MapInternalIDs()
     StartAutoToggle()
 }
 
 ; ==========================================
-; CRASH-PROOF HOTPLUG DETECTION
+; HOTPLUG DETECTION (Windows Native)
 ; ==========================================
-IsExternalKeyboardPresentWindowsAPI() {
+IsExternalKeyboardPresent() {
     baselineCount := Number(IniRead(ConfigFile, "Settings", "BaselineRawCount", 0))
     if (baselineCount == 0)
         return false
 
     currentCount := GetCurrentRawKeyboardCount()
-    
-    ; If Windows currently sees more raw keyboards than our baseline, an external device is attached
     return (currentCount > baselineCount)
 }
 
 GetCurrentRawKeyboardCount() {
     static RIM_TYPEKEYBOARD := 1
     
+    ; Dynamically determine struct size: 16 bytes on 64-bit, 8 bytes on 32-bit
+    cbSize := (A_PtrSize == 8) ? 16 : 8
+    
     count := 0
-    if DllCall("User32\GetRawInputDeviceList", "Ptr", 0, "UInt*", &count, "UInt", 8) != 0
+    ; First call with NULL pointer gets the total number of raw devices
+    if (DllCall("User32\GetRawInputDeviceList", "Ptr", 0, "UInt*", &count, "UInt", cbSize) == -1)
         return 0
         
     if (count == 0)
         return 0
 
-    RAWINPUTDEVICELIST := Buffer(count * 8, 0)
-    if DllCall("User32\GetRawInputDeviceList", "Ptr", RAWINPUTDEVICELIST, "UInt*", &count, "UInt", 8) == -1
+    ; Allocate the exact buffer size needed
+    RAWINPUTDEVICELIST := Buffer(count * cbSize, 0)
+    
+    ; Second call actually fills the buffer with the device list
+    if (DllCall("User32\GetRawInputDeviceList", "Ptr", RAWINPUTDEVICELIST, "UInt*", &count, "UInt", cbSize) == -1)
         return 0
 
     keyboardCount := 0
     Loop count {
-        type := NumGet(RAWINPUTDEVICELIST, (A_Index - 1) * 8 + 4, "UInt")
+        ; dwType memory offset is 8 on 64-bit, 4 on 32-bit
+        dwTypeOffset := (A_PtrSize == 8) ? 8 : 4
+        type := NumGet(RAWINPUTDEVICELIST, (A_Index - 1) * cbSize + dwTypeOffset, "UInt")
+        
         if (type == RIM_TYPEKEYBOARD)
             keyboardCount++
     }
@@ -210,7 +226,7 @@ GetCurrentRawKeyboardCount() {
 }
 
 ; ==========================================
-; SAFE MONITORING (No Interception Polling)
+; SAFE MONITORING
 ; ==========================================
 StartAutoToggle() {
     static isStarted := false
@@ -225,20 +241,17 @@ StartAutoToggle() {
 }
 
 OnDeviceChange(wParam, lParam, msg, hwnd) {
-    if (wParam == 0x8000 || wParam == 0x8004) {
-        ; Wait 1.5 seconds for Windows PnP to fully settle
-        SetTimer(CheckDevices, -1500)
-    }
+    ; Any WM_DEVICECHANGE message triggers a re-evaluation after Windows PnP settles
+    SetTimer(CheckDevices, -1500)
 }
 
-; Check for external keyboards using Windows Native Raw Input API (100% safe for Interception)
 CheckDevices() {
     global isBlocked, InternalIDs, KeepInternalKeyboardEnabled
 
     if (InternalIDs.Length == 0)
         return
 
-    extConnected := IsExternalKeyboardPresentWindowsAPI()
+    extConnected := IsExternalKeyboardPresent()
     shouldBlock := extConnected && !KeepInternalKeyboardEnabled
 
     if (shouldBlock && !isBlocked) {

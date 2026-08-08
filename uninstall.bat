@@ -35,6 +35,7 @@ if exist "%~dp0CommandLineInstaller\install-interception.exe" (
         echo Skipping driver uninstall.
     ) else (
         "%~dp0CommandLineInstaller\install-interception.exe" /uninstall
+        start /wait "" "C:\Program Files\Interception Driver Fix\unins000.exe"
         set "driverRemoved=1"
     )
 ) else (

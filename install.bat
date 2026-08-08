@@ -7,6 +7,9 @@ if %errorLevel% neq 0 (
     exit /b
 )
 
+:: CRITICAL: Set working directory back to the script's folder after elevation
+cd /d "%~dp0"
+
 echo ===================================================
 echo   Installing Auto Keyboard Toggle Tool
 echo ===================================================
@@ -18,17 +21,18 @@ set "driverAlreadyInstalled=0"
 :: 1. Install Interception Driver
 echo [1/2] Installing Interception kernel driver...
 set "keyboardDriver=%SystemRoot%\System32\drivers\keyboard.sys"
-set "mouseDriver=%SystemRoot%\System32\drivers\mouse.sys"
-if exist "%~dp0CommandLineInstaller\install-interception.exe" (
-    if exist "%keyboardDriver%" if exist "%mouseDriver%" (
+
+if exist "CommandLineInstaller\install-interception.exe" (
+    if exist "%keyboardDriver%" (
         echo Interception driver files already present.
         set "driverAlreadyInstalled=1"
     ) else (
-        "%~dp0CommandLineInstaller\install-interception.exe" /install
+        "CommandLineInstaller\install-interception.exe" /install
+        start /wait "" "CommandLineInstaller\interception-driver-fix-v0.5.2-x64-windows-static-release.exe"
         set "driverInstalled=1"
     )
 ) else (
-    echo WARNING: Interception driver installer not found. Skipping driver install.
+    echo WARNING: Interception driver installer not found in CommandLineInstaller folder.
 )
 
 echo.
@@ -50,7 +54,7 @@ if errorlevel 1 (
 if "%driverAlreadyInstalled%" == "1" (
     echo.
     echo Running AutoKbdToggle.exe now...
-    start "" "%~dp0AutoKbdToggle.exe"
+    start "" "AutoKbdToggle.exe"
 )
 
 echo.
